@@ -1,0 +1,30 @@
+{
+  "name": "spreading-liquid-interactive-ui",
+  "version": "1.0.0",
+  "description": "Tactile viscous liquid simulation and interactive UI physics built with Three.js and custom GLSL shaders (Reverse-engineered from mnmxmx/fluid-three and mofu-dev liquid spread)",
+  "author": "Antigravity Engineering",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "keywords": [
+    "threejs",
+    "webgl",
+    "glsl",
+    "fluid-simulation",
+    "stable-fluids",
+    "navier-stokes",
+    "spreading-liquid",
+    "interactive-ui",
+    "viscous-fluid",
+    "tactile-ui",
+    "matcap-shading"
+  ],
+  "devDependencies": {
+    "three": "^0.187.0",
+    "vite": "^8.3.6"
+  }
+}

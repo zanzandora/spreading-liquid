@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Spreading Liquid Demo</title>
+    <link rel="stylesheet" href="./style.css">
+</head>
+<body>
+
+    <!-- Centered Square Demo Container (Exact layout from the video) -->
+    <div class="demo-container">
+        <!-- WebGL Canvas -->
+        <div id="canvas-container"></div>
+
+        <!-- Reset Button -->
+        <button class="reset-btn" id="resetBtn" type="button">
+            <svg viewBox="0 0 24 24">
+                <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/>
+                <path d="M3 3v5h5"/>
+            </svg>
+            <span>Reset</span>
+        </button>
+    </div>
+
+    <!-- Main Application Entry Point -->
+    <script type="module" src="./src/main.js"></script>
+</body>
+</html>

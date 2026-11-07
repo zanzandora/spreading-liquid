@@ -1,0 +1,16 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+
+# Production build
+dist/
+dist-ssr/
+*.local
+
+# Editor & System
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.log
+*.mp4
