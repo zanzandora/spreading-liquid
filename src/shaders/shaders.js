@@ -1,9 +1,8 @@
 /**
  * GLSL Shaders for 2.5D Viscoplastic Paste Smearing (mofu-dev liquid spreading)
- * Implements:
- * 1. True Hemispherical Dome Initialization
- * 2. Mass-Conserved Local Heightfield Smearing, Plowing (Trough & Ridge), and Head Ripples
- * 3. Gradient Normal Reconstruction and Matcap Shading with Thin-Film Fade
+ * 2-Channel Architecture:
+ * - Channel .r (volH): Macro Volume & Mass Conservation (never destroyed by trough carve)
+ * - Channel .g (sculptH): Surface Topography (trough depression, lateral ridges, head ripples)
  */
 
 export const baseVert = `
@@ -22,7 +21,8 @@ void main() {
 
 /**
  * Step A: True Hemispherical Dome Initialization
- * h(x, y) = sqrt(max(0.0, R^2 - ||p - c||^2))
+ * - Channel .r (volH): True 3D hemispherical dome volume
+ * - Channel .g (sculptH): 0.0 (pristine surface before brush contact)
  */
 export const initDropFrag = `
 precision highp float;
@@ -42,6 +42,7 @@ void main() {
         float h = sqrt(max(0.0, rSq - distSq));
         float dist = sqrt(distSq);
         float rimAlpha = smoothstep(uRadius, uRadius - 0.003, dist);
+        // .r = Macro Volume, .g = Initial Surface Sculpt (0.0)
         gl_FragColor = vec4(h * rimAlpha, 0.0, 0.0, 1.0);
     } else {
         gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0);
@@ -50,11 +51,9 @@ void main() {
 `;
 
 /**
- * Step B: 2.5D Viscoplastic Local Smear, Plowing & Ripples (heightAdvection.frag)
- * - sdSegment prevents gaps during fast drags
- * - Local smear carry inside brush core
- * - Mass-conserved plowing: carves trough in center, builds ridges on sides & front bow wave
- * - Head ripples create concentric finger ridges under cursor
+ * Step B: 2-Channel Viscoplastic Smear & Sculpt (heightAdvection.frag)
+ * - Channel .r (volH): Mass-conserving advection and transport. NEVER carved to zero.
+ * - Channel .g (sculptH): Micro-relief (trough indent, side ridges, concentric ripples).
  */
 export const heightSmearFrag = `
 precision highp float;
@@ -66,7 +65,7 @@ uniform vec2 uPrevMouse;  // Previous mouse position (UV space)
 uniform float uBrushRadius;
 uniform float uIsDown;
 
-// Distance to line segment to guarantee continuous strokes during fast drags
+// Exact capsule distance to stroke segment to avoid gaps during fast drags
 float sdSegment(vec2 p, vec2 a, vec2 b, out float hProj) {
     vec2 pa = p - a, ba = b - a;
     float lenSq = dot(ba, ba);
@@ -75,12 +74,15 @@ float sdSegment(vec2 p, vec2 a, vec2 b, out float hProj) {
 }
 
 void main() {
-    float currentH = texture2D(uHeightMap, vUv).r;
+    vec4 currentData = texture2D(uHeightMap, vUv);
+    float currentVol = currentData.r;
+    float currentSculpt = currentData.g;
+
     vec2 strokeVec = uMouse - uPrevMouse;
     float strokeLen = length(strokeVec);
 
     if (uIsDown < 0.5 || strokeLen < 1e-5) {
-        gl_FragColor = vec4(currentH, 0.0, 0.0, 1.0);
+        gl_FragColor = currentData;
         return;
     }
 
@@ -89,24 +91,39 @@ void main() {
     float distSeg = sdSegment(vUv, uPrevMouse, uMouse, tProj);
     float distHead = length(vUv - uMouse);
 
-    // 1. KÉO TRƯỢT CỤC BỘ (Local Smear Advection) chỉ trong lòng nét cọ
-    float carryMask = smoothstep(uBrushRadius * 1.15, 0.0, distSeg);
-    vec2 sampleUv = vUv - strokeVec * carryMask * 0.90;
-    float smearedH = texture2D(uHeightMap, sampleUv).r;
+    // Brush coverage mask
+    float brushMask = smoothstep(uBrushRadius * 1.15, 0.0, distSeg);
 
-    // Hao hụt nhẹ khi kéo kem đi xa trên bề mặt phẳng
-    float baseH = mix(currentH, smearedH * 0.985, carryMask);
+    // =========================================================================
+    // 1. KÊNH .r (volH - Thể tích vĩ mô & Bảo toàn khối lượng):
+    // Vận chuyển kem theo cọ ra vùng trống mà KHÔNG bị carve trừ triệt tiêu.
+    // =========================================================================
+    vec2 sampleUv = vUv - strokeVec * brushMask * 0.95;
+    float smearedVol = texture2D(uHeightMap, sampleUv).r;
 
-    // 2. KHOÉT RÃNH (Trough) & ĐÙN GỜ HAI BÊN (Ridge Pile-up)
-    float availableVolume = smoothstep(0.002, 0.035, baseH);
+    // Khi kéo ra vùng trống (currentVol thấp, smearedVol cao), suy hao nhẹ theo quãng đường strokeLen
+    // để kem vươn dài thành dải bản rộng rồi mỏng dần tự nhiên.
+    float distanceDecay = clamp(1.0 - strokeLen * 0.65, 0.92, 1.0);
+    float transportedVol = smearedVol * distanceDecay;
 
-    // Mặt cắt ngang của rãnh (lõm ở giữa: d < 0.78 * R)
-    float innerNorm = distSeg / (uBrushRadius * 0.78);
-    float troughProfile = max(0.0, 1.0 - innerNorm * innerNorm);
+    // Pha trộn thể tích theo vùng phủ của cọ
+    float nextVol = mix(currentVol, transportedVol, brushMask);
 
-    // Mặt cắt vành gờ hai bên & phía trước đầu cọ (0.7 * R < d < 1.35 * R)
-    float ringCenter = uBrushRadius * 0.95;
-    float ringWidth = uBrushRadius * 0.35;
+    // =========================================================================
+    // 2. KÊNH .g (sculptH - Địa hình bề mặt / Rãnh cọ, Gờ đùn & Gợn vân):
+    // Chỉ tạo biến dạng khi có lớp kem bên dưới (nextVol > ngưỡng tối thiểu).
+    // Khi xoay cọ tại chỗ, volH giữ nguyên còn sculptH liên tục in các nếp gờ mới.
+    // =========================================================================
+    float hasVolume = smoothstep(0.003, 0.035, nextVol);
+
+    // Mặt cắt rãnh cọ (Lõm nhẹ ở giữa: d < 0.75 * R)
+    float innerNorm = distSeg / (uBrushRadius * 0.75);
+    float troughShape = max(0.0, 1.0 - innerNorm * innerNorm);
+    float troughIndent = -0.018 * troughShape;
+
+    // Mặt cắt gờ đùn hai bên sườn (0.75 * R < d < 1.35 * R)
+    float ringCenter = uBrushRadius * 0.92;
+    float ringWidth = uBrushRadius * 0.32;
     float ringDist = (distSeg - ringCenter) / ringWidth;
     float sideRidge = exp(-ringDist * ringDist * 2.2);
 
@@ -115,23 +132,25 @@ void main() {
     float frontBias = smoothstep(-0.2, 0.8, dot(normalize(toFrag + 1e-6), strokeDir));
     float headRing = exp(-pow((distHead - ringCenter) / ringWidth, 2.0) * 2.0) * frontBias;
 
-    // Vân gợn nhỏ (Ripples) dưới đáy cọ tại đầu chuột
-    float headRipple = sin(distHead / uBrushRadius * 26.0) * 0.012 * smoothstep(uBrushRadius * 0.8, 0.0, distHead);
+    float ridgePlow = 0.024 * (sideRidge * 0.85 + headRing * 0.95);
 
-    // Bảo toàn khối lượng cục bộ: vét kem ở rãnh, đùn lên gờ xung quanh
-    float speedFactor = min(strokeLen * 18.0, 1.0);
-    float scooped = baseH * 0.52 * troughProfile * availableVolume * speedFactor;
-    float depositProfile = sideRidge * 0.85 + headRing * 0.95;
-    float deposited = scooped * depositProfile;
+    // Gợn vân đồng tâm sống động dưới đầu chuột như ở bản gốc
+    float rippleFreq = distHead / uBrushRadius * 28.0;
+    float headRipple = sin(rippleFreq) * 0.010 * smoothstep(uBrushRadius * 0.85, 0.0, distHead);
 
-    float finalH = max(0.0, baseH - scooped + deposited + headRipple * availableVolume * baseH);
+    // Độ lệch địa hình cục bộ của nét cọ hiện tại
+    float newImpression = (troughIndent + ridgePlow + headRipple) * hasVolume;
 
-    gl_FragColor = vec4(finalH, 0.0, 0.0, 1.0);
+    // Vận chuyển nhẹ địa hình cũ theo dòng chảy và ghi đè nét cọ mới
+    float advectedSculpt = texture2D(uHeightMap, sampleUv).g;
+    float nextSculpt = mix(advectedSculpt, newImpression, brushMask * 0.88);
+
+    gl_FragColor = vec4(nextVol, nextSculpt, 0.0, 1.0);
 }
 `;
 
 /**
- * Step C: Tái tạo Pháp tuyến (Normal) sắc nét và Matcap Shading (liquidRender.frag)
+ * Step C: Tái tạo Pháp tuyến sắc nét và Shading độ che phủ cao (liquidRender.frag)
  */
 export const liquidRenderFrag = `
 precision highp float;
@@ -142,32 +161,50 @@ uniform sampler2D uMatcap;
 uniform vec2 uTexelSize;
 uniform float uNormalScale;
 
-void main() {
-    float hC = texture2D(uHeightMap, vUv).r;
+// Tính độ cao tổng hợp để xây dựng vector pháp tuyến quang học
+float getCompositeHeight(vec4 data) {
+    float vol = data.r;
+    float sculpt = data.g;
+    // sculpt chỉ tác động khi có thể tích, không bao giờ làm thủng nền (vol)
+    float sculptScale = clamp(vol / 0.04, 0.0, 1.0);
+    return max(0.0005, vol + sculpt * sculptScale);
+}
 
-    // Ngưỡng cắt alpha mượt ở rìa giọt kem và đuôi nét kéo
-    float alpha = smoothstep(0.0006, 0.006, hC);
+void main() {
+    vec4 cData = texture2D(uHeightMap, vUv);
+    float vol = cData.r;
+
+    // Cắt alpha sắc nét ở mép ngoài cùng (chỉ khi hoàn toàn không có kem)
+    float alpha = smoothstep(0.0005, 0.0035, vol);
     if (alpha <= 0.001) {
-        gl_FragColor = vec4(1.0); // Nền trắng
+        gl_FragColor = vec4(1.0); // Nền trắng tinh
         return;
     }
 
-    // Lấy mẫu lân cận tính vector pháp tuyến từ trường độ cao
-    float hL = texture2D(uHeightMap, vUv - vec2(uTexelSize.x, 0.0)).r;
-    float hR = texture2D(uHeightMap, vUv + vec2(uTexelSize.x, 0.0)).r;
-    float hD = texture2D(uHeightMap, vUv - vec2(0.0, uTexelSize.y)).r;
-    float hU = texture2D(uHeightMap, vUv + vec2(0.0, uTexelSize.y)).r;
+    // 4-Tap gradient tính vector pháp tuyến từ địa hình tổng hợp
+    vec4 dL = texture2D(uHeightMap, vUv - vec2(uTexelSize.x, 0.0));
+    vec4 dR = texture2D(uHeightMap, vUv + vec2(uTexelSize.x, 0.0));
+    vec4 dD = texture2D(uHeightMap, vUv - vec2(0.0, uTexelSize.y));
+    vec4 dU = texture2D(uHeightMap, vUv + vec2(0.0, uTexelSize.y));
+
+    float hL = getCompositeHeight(dL);
+    float hR = getCompositeHeight(dR);
+    float hD = getCompositeHeight(dD);
+    float hU = getCompositeHeight(dU);
 
     vec2 grad = vec2(hR - hL, hU - hD) / (2.0 * uTexelSize);
     vec3 normal = normalize(vec3(-grad * uNormalScale, 1.0));
 
-    // Tra cứu MatCap từ View-space Normal
+    // Tra cứu View-space Matcap
     vec2 matcapUv = normal.xy * 0.492 + 0.5;
     vec3 liquidColor = texture2D(uMatcap, matcapUv).rgb;
 
-    // Hòa trộn mượt với nền trắng ở các dải kem mỏng (Beer-Lambert / Thin-film fade)
-    float thicknessFade = smoothstep(0.0, 0.04, hC);
-    vec3 finalColor = mix(vec3(1.0), liquidColor, alpha * mix(0.40, 1.0, thicknessFade));
+    // Giữ độ che phủ (Coverage) cao của kem đặc:
+    // Ngay cả khi bị cọ ép mỏng, kem vẫn giữ sắc xanh đậm đà (alpha >= 75%)
+    // Chỉ mép ngoài cùng của vệt thoa mới chuyển tiếp mượt mà vào nền trắng
+    float thinFade = smoothstep(0.0006, 0.012, vol);
+    float coverageAlpha = alpha * mix(0.72, 1.0, thinFade);
+    vec3 finalColor = mix(vec3(1.0), liquidColor, coverageAlpha);
 
     gl_FragColor = vec4(finalColor, 1.0);
 }
