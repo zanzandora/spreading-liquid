@@ -1,8 +1,9 @@
 /**
- * GLSL Shaders for mofu-dev Liquid Spreading simulation
- * Directly following the exact implementation in:
- * https://mofu-dev.com/blog/fluid-foundation/
- * and mnmxmx/fluid-three
+ * GLSL Shaders for 2.5D Viscoplastic Paste Smearing (mofu-dev liquid spreading)
+ * Implements:
+ * 1. True Hemispherical Dome Initialization
+ * 2. Mass-Conserved Local Heightfield Smearing, Plowing (Trough & Ridge), and Head Ripples
+ * 3. Gradient Normal Reconstruction and Matcap Shading with Thin-Film Fade
  */
 
 export const baseVert = `
@@ -19,9 +20,10 @@ void main() {
 }
 `;
 
-// Initial droplet dome matching mofu-dev:
-// float calculateHeight(float value) { return sqrt((1.0 - value * value) / 12.0); }
-// height = smoothstep(0.0, 0.025, height) * height * 0.66;
+/**
+ * Step A: True Hemispherical Dome Initialization
+ * h(x, y) = sqrt(max(0.0, R^2 - ||p - c||^2))
+ */
 export const initDropFrag = `
 precision highp float;
 
@@ -30,265 +32,142 @@ uniform vec2 uResolution;
 uniform vec2 uCenter;
 uniform float uRadius;
 
-float calculateHeight(float value) {
-    return sqrt(max(0.0, (1.0 - value * value) / 12.0));
-}
-
 void main() {
     vec2 ratio = uResolution / min(uResolution.x, uResolution.y);
-    vec2 point = (vUv - uCenter) * 2.0 * ratio;
-    float dist = length(point);
+    vec2 p = (vUv - uCenter) * ratio;
+    float distSq = dot(p, p);
+    float rSq = uRadius * uRadius;
 
-    float factor = smoothstep(0.0, uRadius * 2.0, dist);
-    float height = calculateHeight(factor);
-    height = smoothstep(0.0, 0.025, height) * height * 0.66;
-
-    gl_FragColor = vec4(height, 0.0, 0.0, 1.0);
-}
-`;
-
-// External force injection (brush splat)
-export const splatFrag = `
-precision highp float;
-
-varying vec2 vUv;
-uniform sampler2D uTarget;
-uniform vec2 uPoint;
-uniform vec2 uForce;
-uniform float uRadius;
-uniform float uAspectRatio;
-
-void main() {
-    vec2 p = vUv - uPoint;
-    p.x *= uAspectRatio;
-    float dist = length(p);
-    float d = max(0.0, 1.0 - dist / uRadius);
-    d = d * d;
-
-    vec2 base = texture2D(uTarget, vUv).xy;
-    gl_FragColor = vec4(base + uForce * d, 0.0, 1.0);
-}
-`;
-
-// Advection with BFECC (from mnmxmx/fluid-three advection.frag)
-export const advectionFrag = `
-precision highp float;
-
-varying vec2 vUv;
-uniform sampler2D uVelocity;
-uniform sampler2D uSource;
-uniform vec2 uFboSize;
-uniform float uDt;
-uniform float uDissipation;
-uniform bool uIsBFECC;
-
-void main() {
-    vec2 ratio = max(uFboSize.x, uFboSize.y) / uFboSize;
-
-    if (!uIsBFECC) {
-        vec2 vel = texture2D(uVelocity, vUv).xy;
-        vec2 uv2 = vUv - vel * uDt * ratio;
-        vec2 newVel = texture2D(uSource, uv2).xy;
-        gl_FragColor = vec4(newVel * (1.0 - uDissipation * uDt), 0.0, 1.0);
+    if (distSq < rSq) {
+        float h = sqrt(max(0.0, rSq - distSq));
+        float dist = sqrt(distSq);
+        float rimAlpha = smoothstep(uRadius, uRadius - 0.003, dist);
+        gl_FragColor = vec4(h * rimAlpha, 0.0, 0.0, 1.0);
     } else {
-        vec2 spot_new = vUv;
-        vec2 vel_old = texture2D(uVelocity, vUv).xy;
-
-        // 1. Back trace
-        vec2 spot_old = spot_new - vel_old * uDt * ratio;
-        vec2 vel_new1 = texture2D(uVelocity, spot_old).xy;
-
-        // 2. Forward trace
-        vec2 spot_new2 = spot_old + vel_new1 * uDt * ratio;
-        vec2 error = spot_new2 - spot_new;
-
-        // 3. Compensate error
-        vec2 spot_new3 = spot_new - error * 0.5;
-        vec2 vel_2 = texture2D(uVelocity, spot_new3).xy;
-
-        // 4. Back trace corrected
-        vec2 spot_old2 = spot_new3 - vel_2 * uDt * ratio;
-        vec2 newVel2 = texture2D(uSource, spot_old2).xy;
-
-        gl_FragColor = vec4(newVel2 * (1.0 - uDissipation * uDt), 0.0, 1.0);
+        gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0);
     }
 }
 `;
 
-// Divergence of velocity field (from fluid-three divergence.frag)
-export const divergenceFrag = `
+/**
+ * Step B: 2.5D Viscoplastic Local Smear, Plowing & Ripples (heightAdvection.frag)
+ * - sdSegment prevents gaps during fast drags
+ * - Local smear carry inside brush core
+ * - Mass-conserved plowing: carves trough in center, builds ridges on sides & front bow wave
+ * - Head ripples create concentric finger ridges under cursor
+ */
+export const heightSmearFrag = `
 precision highp float;
 
 varying vec2 vUv;
-uniform sampler2D uVelocity;
-uniform float uDt;
-uniform vec2 uPx;
+uniform sampler2D uHeightMap;
+uniform vec2 uMouse;      // Current mouse position (UV space)
+uniform vec2 uPrevMouse;  // Previous mouse position (UV space)
+uniform float uBrushRadius;
+uniform float uIsDown;
 
-void main() {
-    float x0 = texture2D(uVelocity, vUv - vec2(uPx.x, 0.0)).x;
-    float x1 = texture2D(uVelocity, vUv + vec2(uPx.x, 0.0)).x;
-    float y0 = texture2D(uVelocity, vUv - vec2(0.0, uPx.y)).y;
-    float y1 = texture2D(uVelocity, vUv + vec2(0.0, uPx.y)).y;
-
-    float divergence = (x1 - x0 + y1 - y0) * 0.5;
-    gl_FragColor = vec4(divergence / uDt, 0.0, 0.0, 1.0);
+// Distance to line segment to guarantee continuous strokes during fast drags
+float sdSegment(vec2 p, vec2 a, vec2 b, out float hProj) {
+    vec2 pa = p - a, ba = b - a;
+    float lenSq = dot(ba, ba);
+    hProj = (lenSq > 1e-6) ? clamp(dot(pa, ba) / lenSq, 0.0, 1.0) : 0.0;
+    return length(pa - ba * hProj);
 }
-`;
-
-// Pressure Poisson Jacobi solver (from fluid-three poisson.frag)
-export const pressureFrag = `
-precision highp float;
-
-varying vec2 vUv;
-uniform sampler2D uPressure;
-uniform sampler2D uDivergence;
-uniform vec2 uPx;
 
 void main() {
-    float p0 = texture2D(uPressure, vUv + vec2(uPx.x * 2.0, 0.0)).r;
-    float p1 = texture2D(uPressure, vUv - vec2(uPx.x * 2.0, 0.0)).r;
-    float p2 = texture2D(uPressure, vUv + vec2(0.0, uPx.y * 2.0)).r;
-    float p3 = texture2D(uPressure, vUv - vec2(0.0, uPx.y * 2.0)).r;
-    float div = texture2D(uDivergence, vUv).r;
+    float currentH = texture2D(uHeightMap, vUv).r;
+    vec2 strokeVec = uMouse - uPrevMouse;
+    float strokeLen = length(strokeVec);
 
-    float newP = (p0 + p1 + p2 + p3) * 0.25 - div;
-    gl_FragColor = vec4(newP, 0.0, 0.0, 1.0);
-}
-`;
+    if (uIsDown < 0.5 || strokeLen < 1e-5) {
+        gl_FragColor = vec4(currentH, 0.0, 0.0, 1.0);
+        return;
+    }
 
-// Gradient Subtract to enforce incompressibility (from fluid-three pressure.frag)
-export const gradientSubtractFrag = `
-precision highp float;
+    vec2 strokeDir = strokeVec / strokeLen;
+    float tProj;
+    float distSeg = sdSegment(vUv, uPrevMouse, uMouse, tProj);
+    float distHead = length(vUv - uMouse);
 
-varying vec2 vUv;
-uniform sampler2D uPressure;
-uniform sampler2D uVelocity;
-uniform vec2 uPx;
-uniform float uDt;
+    // 1. KÉO TRƯỢT CỤC BỘ (Local Smear Advection) chỉ trong lòng nét cọ
+    float carryMask = smoothstep(uBrushRadius * 1.15, 0.0, distSeg);
+    vec2 sampleUv = vUv - strokeVec * carryMask * 0.90;
+    float smearedH = texture2D(uHeightMap, sampleUv).r;
 
-void main() {
-    float step = 1.0;
-    float p0 = texture2D(uPressure, vUv + vec2(uPx.x * step, 0.0)).r;
-    float p1 = texture2D(uPressure, vUv - vec2(uPx.x * step, 0.0)).r;
-    float p2 = texture2D(uPressure, vUv + vec2(0.0, uPx.y * step)).r;
-    float p3 = texture2D(uPressure, vUv - vec2(0.0, uPx.y * step)).r;
+    // Hao hụt nhẹ khi kéo kem đi xa trên bề mặt phẳng
+    float baseH = mix(currentH, smearedH * 0.985, carryMask);
 
-    vec2 v = texture2D(uVelocity, vUv).xy;
-    vec2 gradP = vec2(p0 - p1, p2 - p3) * 0.5;
-    v = v - gradP * uDt;
+    // 2. KHOÉT RÃNH (Trough) & ĐÙN GỜ HAI BÊN (Ridge Pile-up)
+    float availableVolume = smoothstep(0.002, 0.035, baseH);
 
-    gl_FragColor = vec4(v, 0.0, 1.0);
+    // Mặt cắt ngang của rãnh (lõm ở giữa: d < 0.78 * R)
+    float innerNorm = distSeg / (uBrushRadius * 0.78);
+    float troughProfile = max(0.0, 1.0 - innerNorm * innerNorm);
+
+    // Mặt cắt vành gờ hai bên & phía trước đầu cọ (0.7 * R < d < 1.35 * R)
+    float ringCenter = uBrushRadius * 0.95;
+    float ringWidth = uBrushRadius * 0.35;
+    float ringDist = (distSeg - ringCenter) / ringWidth;
+    float sideRidge = exp(-ringDist * ringDist * 2.2);
+
+    // Gờ đùn phía trước mũi cọ (Bow wave)
+    vec2 toFrag = vUv - uMouse;
+    float frontBias = smoothstep(-0.2, 0.8, dot(normalize(toFrag + 1e-6), strokeDir));
+    float headRing = exp(-pow((distHead - ringCenter) / ringWidth, 2.0) * 2.0) * frontBias;
+
+    // Vân gợn nhỏ (Ripples) dưới đáy cọ tại đầu chuột
+    float headRipple = sin(distHead / uBrushRadius * 26.0) * 0.012 * smoothstep(uBrushRadius * 0.8, 0.0, distHead);
+
+    // Bảo toàn khối lượng cục bộ: vét kem ở rãnh, đùn lên gờ xung quanh
+    float speedFactor = min(strokeLen * 18.0, 1.0);
+    float scooped = baseH * 0.52 * troughProfile * availableVolume * speedFactor;
+    float depositProfile = sideRidge * 0.85 + headRing * 0.95;
+    float deposited = scooped * depositProfile;
+
+    float finalH = max(0.0, baseH - scooped + deposited + headRipple * availableVolume * baseH);
+
+    gl_FragColor = vec4(finalH, 0.0, 0.0, 1.0);
 }
 `;
 
 /**
- * mofu-dev Height Map Advection Shader (height.frag)
- * Exactly as detailed in:
- * https://mofu-dev.com/blog/fluid-foundation/
+ * Step C: Tái tạo Pháp tuyến (Normal) sắc nét và Matcap Shading (liquidRender.frag)
  */
-export const heightFrag = `
+export const liquidRenderFrag = `
 precision highp float;
 
 varying vec2 vUv;
-uniform sampler2D uVelocity;
-uniform sampler2D uHeight;
-uniform vec2 uFboSize;
-uniform float uDt;
-uniform vec2 uVelocityThreshold;
-
-vec2 backtraceUv(vec2 uv, vec2 flow, vec2 fboSize, float dt) {
-    vec2 ratio = max(fboSize.x, fboSize.y) / fboSize;
-    return uv - flow * dt * ratio;
-}
-
-void main() {
-    vec2 flow = texture2D(uVelocity, vUv).xy;
-    vec2 sourceUv = backtraceUv(vUv, flow, uFboSize, uDt);
-
-    // 1. Thickness removed at current pixel
-    float previousHeight = texture2D(uHeight, vUv).r;
-    float previousVelocity = length(flow);
-    float previousStrength = smoothstep(uVelocityThreshold.x, uVelocityThreshold.y, previousVelocity);
-    float removed = min(previousHeight, previousStrength * 0.3 * previousHeight);
-
-    // 2. Thickness added from upstream position
-    float sourceHeight = texture2D(uHeight, sourceUv).r;
-    float sourceVelocity = length(texture2D(uVelocity, sourceUv).xy);
-    float sourceStrength = smoothstep(uVelocityThreshold.x, uVelocityThreshold.y, sourceVelocity);
-    float added = min(sourceHeight, sourceStrength * 0.3 * sourceHeight);
-
-    // 3. Next height thickness
-    float nextHeight = max(0.0, previousHeight - removed + added);
-
-    gl_FragColor = vec4(nextHeight, 0.0, 0.0, 1.0);
-}
-`;
-
-/**
- * mofu-dev Alpha Map Shader (alpha.frag)
- * Exactly as detailed in:
- * https://mofu-dev.com/blog/fluid-foundation/
- */
-export const alphaFrag = `
-precision highp float;
-
-varying vec2 vUv;
-uniform sampler2D uHeight;
-uniform sampler2D uAlphaMap;
-uniform float uDecay;
-
-void main() {
-    float previousMaximum = texture2D(uAlphaMap, vUv).r;
-    float current = smoothstep(0.0, 0.01 / 0.7, max(0.0, texture2D(uHeight, vUv).r));
-    float maximum = max(current, previousMaximum * uDecay);
-
-    gl_FragColor = vec4(
-        maximum,
-        maximum * 0.5 + current * 0.5,
-        0.0,
-        1.0
-    );
-}
-`;
-
-/**
- * mofu-dev Render Shader (render.frag)
- * Exactly as detailed in:
- * https://mofu-dev.com/blog/fluid-foundation/
- */
-export const renderFrag = `
-precision highp float;
-
-varying vec2 vUv;
-uniform sampler2D uHeight;
-uniform sampler2D uAlphaMap;
+uniform sampler2D uHeightMap;
 uniform sampler2D uMatcap;
-uniform vec2 uResolution;
+uniform vec2 uTexelSize;
+uniform float uNormalScale;
 
 void main() {
-    float height = texture2D(uHeight, vUv).r;
-    vec2 stepSize = 1.0 / uResolution;
-    vec2 uvX = vUv + vec2(stepSize.x, 0.0);
-    vec2 uvY = vUv + vec2(0.0, stepSize.y);
+    float hC = texture2D(uHeightMap, vUv).r;
 
-    float heightScale = 0.2 / 0.66;
-    vec2 ratio = uResolution / min(uResolution.x, uResolution.y);
+    // Ngưỡng cắt alpha mượt ở rìa giọt kem và đuôi nét kéo
+    float alpha = smoothstep(0.0006, 0.006, hC);
+    if (alpha <= 0.001) {
+        gl_FragColor = vec4(1.0); // Nền trắng
+        return;
+    }
 
-    vec3 position  = vec3((vUv * ratio).x, height * heightScale, (vUv * ratio).y);
-    vec3 positionX = vec3((uvX * ratio).x, texture2D(uHeight, uvX).r * heightScale, (uvX * ratio).y);
-    vec3 positionY = vec3((uvY * ratio).x, texture2D(uHeight, uvY).r * heightScale, (uvY * ratio).y);
+    // Lấy mẫu lân cận tính vector pháp tuyến từ trường độ cao
+    float hL = texture2D(uHeightMap, vUv - vec2(uTexelSize.x, 0.0)).r;
+    float hR = texture2D(uHeightMap, vUv + vec2(uTexelSize.x, 0.0)).r;
+    float hD = texture2D(uHeightMap, vUv - vec2(0.0, uTexelSize.y)).r;
+    float hU = texture2D(uHeightMap, vUv + vec2(0.0, uTexelSize.y)).r;
 
-    vec3 normal = -normalize(cross(positionX - position, positionY - position));
+    vec2 grad = vec2(hR - hL, hU - hD) / (2.0 * uTexelSize);
+    vec3 normal = normalize(vec3(-grad * uNormalScale, 1.0));
 
-    // Sample Matcap using normal.zx * 0.5 + 0.5 with author's +0.05 brightness boost
-    vec2 matcapCoord = normal.zx * 0.5 + 0.5;
-    vec3 color = texture2D(uMatcap, matcapCoord).rgb + 0.05;
+    // Tra cứu MatCap từ View-space Normal
+    vec2 matcapUv = normal.xy * 0.492 + 0.5;
+    vec3 liquidColor = texture2D(uMatcap, matcapUv).rgb;
 
-    float alphaValue = texture2D(uAlphaMap, vUv).g;
-
-    // Smoothstep edge to prevent aliasing, then blended over pure white (#ffffff)
-    float a = smoothstep(0.08, 0.12, alphaValue) * alphaValue;
-    vec3 finalColor = mix(vec3(1.0, 1.0, 1.0), color, a);
+    // Hòa trộn mượt với nền trắng ở các dải kem mỏng (Beer-Lambert / Thin-film fade)
+    float thicknessFade = smoothstep(0.0, 0.04, hC);
+    vec3 finalColor = mix(vec3(1.0), liquidColor, alpha * mix(0.40, 1.0, thicknessFade));
 
     gl_FragColor = vec4(finalColor, 1.0);
 }

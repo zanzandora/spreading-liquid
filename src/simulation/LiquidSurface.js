@@ -4,43 +4,39 @@ import { createLiquidMatcapTexture } from '../materials/matcap.js';
 import {
     baseVert,
     initDropFrag,
-    heightFrag,
-    alphaFrag,
-    renderFrag
+    heightSmearFrag,
+    liquidRenderFrag
 } from '../shaders/shaders.js';
 
 /**
  * LiquidSurface
- * Implements mofu-dev's height-map liquid spreading, historical alpha map,
- * and normal-mapped Matcap rendering.
- * https://mofu-dev.com/blog/fluid-foundation/
+ * Manages 2.5D Viscoplastic Paste Smearing (Local Heightfield Deformation & Plowing).
+ * Replaces global 2D Navier-Stokes solver with direct local shearing, trough carving,
+ * and ridge pile-up.
  */
 export class LiquidSurface {
-    constructor(renderer, fluidSim, options = {}) {
+    constructor(renderer, options = {}) {
         this.renderer = renderer;
-        this.fluidSim = fluidSim;
 
         this.options = Object.assign({
             resolution: 512,
-            dropRadius: 0.165,             // Initial droplet radius matching video (~1/3 container)
-            velocityThresholdMin: 0.001,   // Velocity threshold for thickness removal
-            velocityThresholdMax: 0.045,
-            trailDecay: 1.0,               // Persistent wetting trail (persists until Reset)
-            dt: 0.014
+            dropRadius: 0.165,      // Radius of initial hemisphere (~1/3 container)
+            brushRadius: 0.082,     // Width of spreading finger / brush
+            normalScale: 0.45       // Calibrated slope amplification for true hemisphere specular
         }, options);
 
         this.width = this.options.resolution;
         this.height = this.options.resolution;
 
-        this.fboSize = new THREE.Vector2(this.width, this.height);
         this.resolution = new THREE.Vector2(this.width, this.height);
+        this.texelSize = new THREE.Vector2(1.0 / this.width, 1.0 / this.height);
 
         this.matcapTexture = createLiquidMatcapTexture();
 
         this.initGPGPU();
         this.initRenderTargets();
         this.initMaterials();
-        this.resetToInitialDrops();
+        this.resetToInitialDrop();
     }
 
     initGPGPU() {
@@ -62,11 +58,10 @@ export class LiquidSurface {
         };
 
         this.heightMap = new PingPongRenderTarget(this.width, this.height, opts);
-        this.alphaMap = new PingPongRenderTarget(this.width, this.height, opts);
     }
 
     initMaterials() {
-        // 1. Initial Droplet Dome Material
+        // 1. Initial True Hemispherical Dome Material
         this.initDropMaterial = new THREE.RawShaderMaterial({
             vertexShader: baseVert,
             fragmentShader: initDropFrag,
@@ -79,48 +74,30 @@ export class LiquidSurface {
             depthWrite: false
         });
 
-        // 2. mofu-dev Height Advection Material (height.frag)
-        this.heightMaterial = new THREE.RawShaderMaterial({
+        // 2. 2.5D Local Smear & Plowing Material (heightAdvection.frag)
+        this.smearMaterial = new THREE.RawShaderMaterial({
             vertexShader: baseVert,
-            fragmentShader: heightFrag,
+            fragmentShader: heightSmearFrag,
             uniforms: {
-                uVelocity: { value: null },
-                uHeight: { value: null },
-                uFboSize: { value: this.fboSize },
-                uDt: { value: this.options.dt },
-                uVelocityThreshold: {
-                    value: new THREE.Vector2(
-                        this.options.velocityThresholdMin,
-                        this.options.velocityThresholdMax
-                    )
-                }
+                uHeightMap: { value: null },
+                uMouse: { value: new THREE.Vector2(0.5, 0.5) },
+                uPrevMouse: { value: new THREE.Vector2(0.5, 0.5) },
+                uBrushRadius: { value: this.options.brushRadius },
+                uIsDown: { value: 0.0 }
             },
             depthTest: false,
             depthWrite: false
         });
 
-        // 3. mofu-dev Alpha Map Material (alpha.frag)
-        this.alphaMaterial = new THREE.RawShaderMaterial({
-            vertexShader: baseVert,
-            fragmentShader: alphaFrag,
-            uniforms: {
-                uHeight: { value: null },
-                uAlphaMap: { value: null },
-                uDecay: { value: this.options.trailDecay }
-            },
-            depthTest: false,
-            depthWrite: false
-        });
-
-        // 4. mofu-dev Final Render Material (render.frag)
+        // 3. Normal Reconstruction & Matcap Shading (liquidRender.frag)
         this.renderMaterial = new THREE.RawShaderMaterial({
             vertexShader: baseVert,
-            fragmentShader: renderFrag,
+            fragmentShader: liquidRenderFrag,
             uniforms: {
-                uHeight: { value: null },
-                uAlphaMap: { value: null },
+                uHeightMap: { value: null },
                 uMatcap: { value: this.matcapTexture },
-                uResolution: { value: this.resolution }
+                uTexelSize: { value: this.texelSize },
+                uNormalScale: { value: this.options.normalScale }
             },
             depthTest: false,
             depthWrite: false
@@ -134,8 +111,8 @@ export class LiquidSurface {
         this.renderer.setRenderTarget(null);
     }
 
-    resetToInitialDrops() {
-        // Clear both render targets to transparent black
+    resetToInitialDrop() {
+        // Clear heightMap ping-pong buffers
         const clearTarget = (t) => {
             this.renderer.setRenderTarget(t);
             this.renderer.clearColor();
@@ -143,45 +120,30 @@ export class LiquidSurface {
 
         clearTarget(this.heightMap.read);
         clearTarget(this.heightMap.write);
-        clearTarget(this.alphaMap.read);
-        clearTarget(this.alphaMap.write);
         this.renderer.setRenderTarget(null);
 
-        // Render the initial centered droplet into heightMap.read
+        // Render the initial 3D hemispherical dome into heightMap.read
         this.initDropMaterial.uniforms.uResolution.value.copy(this.resolution);
         this.initDropMaterial.uniforms.uCenter.value.set(0.5, 0.5);
         this.initDropMaterial.uniforms.uRadius.value = this.options.dropRadius;
         this.renderPass(this.initDropMaterial, this.heightMap.read);
-
-        // Pre-fill alpha map from the initial height droplet
-        this.alphaMaterial.uniforms.uHeight.value = this.heightMap.read.texture;
-        this.alphaMaterial.uniforms.uAlphaMap.value = this.alphaMap.read.texture;
-        this.alphaMaterial.uniforms.uDecay.value = 1.0;
-        this.renderPass(this.alphaMaterial, this.alphaMap.write);
-        this.alphaMap.swap();
     }
 
-    update(dt = this.options.dt) {
-        // 1. Height Advection Pass
-        this.heightMaterial.uniforms.uVelocity.value = this.fluidSim.velocity.read.texture;
-        this.heightMaterial.uniforms.uHeight.value = this.heightMap.read.texture;
-        this.heightMaterial.uniforms.uDt.value = dt;
-        this.renderPass(this.heightMaterial, this.heightMap.write);
+    stepSmear(currMouse, prevMouse, isDown) {
+        if (!isDown) return;
+
+        this.smearMaterial.uniforms.uHeightMap.value = this.heightMap.read.texture;
+        this.smearMaterial.uniforms.uMouse.value.set(currMouse.x, currMouse.y);
+        this.smearMaterial.uniforms.uPrevMouse.value.set(prevMouse.x, prevMouse.y);
+        this.smearMaterial.uniforms.uBrushRadius.value = this.options.brushRadius;
+        this.smearMaterial.uniforms.uIsDown.value = isDown ? 1.0 : 0.0;
+
+        this.renderPass(this.smearMaterial, this.heightMap.write);
         this.heightMap.swap();
-
-        // 2. Alpha Map Pass
-        this.alphaMaterial.uniforms.uHeight.value = this.heightMap.read.texture;
-        this.alphaMaterial.uniforms.uAlphaMap.value = this.alphaMap.read.texture;
-        this.alphaMaterial.uniforms.uDecay.value = this.options.trailDecay;
-        this.renderPass(this.alphaMaterial, this.alphaMap.write);
-        this.alphaMap.swap();
-
-        // 3. Prepare Render Material
-        this.renderMaterial.uniforms.uHeight.value = this.heightMap.read.texture;
-        this.renderMaterial.uniforms.uAlphaMap.value = this.alphaMap.read.texture;
     }
 
     renderToScreen() {
+        this.renderMaterial.uniforms.uHeightMap.value = this.heightMap.read.texture;
         this.quad.material = this.renderMaterial;
         this.renderer.setRenderTarget(null);
         this.renderer.render(this.scene, this.camera);
@@ -190,12 +152,10 @@ export class LiquidSurface {
     setSize(width, height) {
         this.resolution.set(width, height);
         this.initDropMaterial.uniforms.uResolution.value.set(width, height);
-        this.renderMaterial.uniforms.uResolution.value.set(width, height);
     }
 
     dispose() {
         this.heightMap.dispose();
-        this.alphaMap.dispose();
         this.matcapTexture.dispose();
         this.geometry.dispose();
     }
