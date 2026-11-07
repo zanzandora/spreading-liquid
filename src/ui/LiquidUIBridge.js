@@ -1,16 +1,17 @@
 /**
  * LiquidInteractionHandler
  * Handles mouse and touch drag interactions on the canvas,
- * feeding continuous stroke segments to the 2.5D viscoplastic smear shader.
+ * injecting velocity into the Eulerian Navier-Stokes solver.
  */
 export class LiquidInteractionHandler {
-    constructor(liquidSurface, canvasElement) {
-        this.liquidSurface = liquidSurface;
+    constructor(fluidSim, canvasElement) {
+        this.fluidSim = fluidSim;
         this.canvas = canvasElement;
 
         this.currPos = { x: 0.5, y: 0.5 };
         this.prevPos = { x: 0.5, y: 0.5 };
         this.isDown = false;
+        this.splatRadius = 0.080;
 
         this.bindEvents();
     }
@@ -46,12 +47,31 @@ export class LiquidInteractionHandler {
             this.currPos.y = pos.y;
 
             if (this.isDown) {
-                const dx = this.currPos.x - this.prevPos.x;
-                const dy = this.currPos.y - this.prevPos.y;
-                const dist = Math.hypot(dx, dy);
+                const totalDx = this.currPos.x - this.prevPos.x;
+                const totalDy = this.currPos.y - this.prevPos.y;
+                const dist = Math.hypot(totalDx, totalDy);
 
-                if (dist > 0.0003) {
-                    this.liquidSurface.stepSmear(this.currPos, this.prevPos, true);
+                if (dist > 0.0004) {
+                    const stepDistance = this.splatRadius * 0.45;
+                    const steps = Math.min(5, Math.max(1, Math.ceil(dist / stepDistance)));
+
+                    const stepDx = totalDx / steps;
+                    const stepDy = totalDy / steps;
+
+                    for (let i = 1; i <= steps; i++) {
+                        const t = i / steps;
+                        const interpX = this.prevPos.x + totalDx * t;
+                        const interpY = this.prevPos.y + totalDy * t;
+
+                        this.fluidSim.addSplat(
+                            interpX,
+                            interpY,
+                            stepDx,
+                            stepDy,
+                            this.splatRadius
+                        );
+                    }
+
                     this.prevPos.x = this.currPos.x;
                     this.prevPos.y = this.currPos.y;
                 }

@@ -1,62 +1,41 @@
-# Spreading Liquid with Three.js — 2.5D Viscoplastic Paste Demo
+# Spreading Liquid with Three.js — Authentic mofu-dev Architecture
 
-> Faithful, physically grounded reconstruction of the interactive cosmetic foundation spreading demo from [Spreading Liquid with Three.js (mofu-dev.com)](https://mofu-dev.com/en/blog/fluid-foundation/?via=dailydev#liquid-spreading-demo) by Misaki Nakano.
-
----
-
-## 1. Physical Insights: Why 2D Navier-Stokes Fails vs. 2.5D Viscoplastic Paste
-
-Standard Eulerian 2D Navier-Stokes solvers (divergence-free $\nabla_{2D} \cdot \vec{u} = 0$, Poisson pressure projection, and vorticity confinement) are designed for low-viscosity fluids (smoke, water dye, ink). When applied to viscous cosmetic cream:
-- **Global Dipole Distortion**: The 2D incompressibility condition forces fluid across the entire canvas to circulate in wide dipole vortices, warping untouched regions and hitting canvas boundaries.
-- **Inability to Form Troughs and Ridges**: Pure coordinate advection $h(\mathbf{u} - \vec{v}\Delta t)$ is a smooth diffeomorphism that merely stretches and flattens a convex dome without ever creating new local minima (grooves under the brush) or local maxima (plowed ridges on the flanks).
-
-**Cosmetic cream is a Bingham viscoplastic paste** in creeping Stokes flow (zero inertia):
-1. **Stationary Outside Brush**: When not in contact with the applicator, the cream remains perfectly motionless.
-2. **2.5D Deformation & Mass Redistribution**: The applicator carves a trough ($h$ decreases) and plows cream outward to form bulging ridges along the flanks and front bow wave.
+> 100% faithful, physically accurate reconstruction of the interactive cosmetics liquid spreading demo from [Spreading Liquid with Three.js (mofu-dev.com)](https://mofu-dev.com/en/blog/fluid-foundation/?via=dailydev#liquid-spreading-demo) by Misaki Nakano.
 
 ---
 
-## 2. Technical Architecture & Shader Pipeline
+## 1. Physical Architecture & Core Mechanics
 
-The entire system is powered by a high-performance **2.5D Local Heightfield Smearing & Plowing** pipeline using Three.js GPGPU Ping-Pong render targets:
+The simulation strictly adheres to the author's original WebGL pipeline:
+1. **Eulerian Navier-Stokes Solver (`FluidSimulation.js`)**:
+   - Reconstructed from [`mnmxmx/fluid-three`](https://github.com/mnmxmx/fluid-three).
+   - Generates the continuous local velocity vector field $\vec{u}$ using 2nd-order BFECC advection and 32 Jacobi Poisson projection steps.
+   - Viscous dissipation prevents residual swirling so velocity naturally decays like a thick viscous emulsion.
+2. **Dynamic Height Map Transport with Velocity Thresholding (`height.frag`)**:
+   - Semi-Lagrangian backtrace: `backtraceUv(uv, flow, fboSize, dt)`.
+   - **Velocity Thresholding (`velocityThreshold`)**: Evaluates `smoothstep(velocityThreshold.x, velocityThreshold.y, length(flow))` to keep distant regions stationary while allowing active core shearing.
+   - **Mass Transfer (`removed` & `added`)**:
+     $$\text{removed} = \min(h_{\text{prev}}, \text{strength} \times 0.3 \times h_{\text{prev}})$$
+     $$\text{added} = \min(h_{\text{source}}, \text{sourceStrength} \times 0.3 \times h_{\text{source}})$$
+     Naturally scoops troughs under the cursor and accumulates ridges along the flanks and front bow wave without artificial geometric carving.
+3. **Historical Alpha Trace Map (`alpha.frag`)**:
+   - Double-buffered FBO tracking peak history:
+     $$\text{maximum} = \max(\text{current}, \text{previousMaximum})$$
+     $$\text{FragColor} = (\text{maximum}, \text{maximum} \times 0.5 + \text{current} \times 0.5, 0.0, 0.0)$$
+   - Leaves a soft, translucent wetting footprint where liquid has passed.
+4. **Analytical Normal & Matcap Shading (`render.frag`)**:
+   - Surface normals derived via finite-difference cross product on 32-bit floating-point textures:
+     $$\vec{n} = -\text{normalize}\left(\text{cross}(\mathbf{p}_x - \mathbf{p}, \mathbf{p}_y - \mathbf{p})\right)$$
+   - Samples procedural sky-blue Matcap via $\vec{n}_{zx} \cdot 0.5 + 0.5$.
+   - Composited smoothly over pure white background (`#ffffff`).
 
-```
-[Pointer Drag Input (UV)]
-          │
-          ▼
-[Step B: heightSmearFrag] ──> PingPongRenderTarget (512x512 HalfFloat)
-  ├── sdSegment (no gaps)
-  ├── Local Smear Advection
-  ├── Trough Carving (scooped)
-  ├── Mexican-Hat Ridge Plowing (deposited)
-  └── Head Ripples under Cursor
-          │
-          ▼
-[Step C: liquidRenderFrag] ──> Screen Canvas
-  ├── 4-tap Gradient Surface Normal
-  ├── Calibrated uNormalScale
-  ├── Procedural MatCap View-Space Lookup
-  └── Beer-Lambert Thin-Film Fade onto #ffffff
-```
+---
 
-### Step A: True Hemispherical Dome Initialization (`initDropFrag`)
-$$h(x, y) = \sqrt{\max\left(0.0, R^2 - \|\mathbf{p} - \mathbf{c}\|^2\right)}$$
-Produces the true 3D dome geometry and antialiased contact rim matching the video's initial state.
+## 2. Technical Specifications
 
-### Step B: Local Smear Advection & Plowing (`heightSmearFrag`)
-- **Continuous Capsule Distance (`sdSegment`)**: Prevents stroke fragmentation during rapid drags.
-- **Local Smear Advection**: Only coordinates inside the brush carry thickness forward.
-- **Mass-Conserving Plowing**:
-  - Center ($d < 0.78 R$): Scoops out a trough.
-  - Flanks ($0.7 R < d < 1.35 R$) & Bow Wave: Mounds the scooped volume into sharp ridges.
-- **Concentric Head Ripples**: Generates subtle tactile ridges directly under the cursor.
-
-### Step C: Analytical Normal Reconstruction & Matcap Shading (`liquidRenderFrag`)
-- Computes analytical surface normal via finite-difference gradient:
-  $$\vec{n} = \text{normalize}\left( -\nabla h \cdot u_{\text{NormalScale}}, 1.0 \right)$$
-- Looks up the sky-blue glossy MatCap texture via view-space normal mapping:
-  $$\text{UV}_{\text{Matcap}} = \vec{n}_{xy} \cdot 0.492 + 0.5$$
-- Smoothly blends with pure white (`#ffffff`) using thin-film thickness attenuation.
+- **FBO Format**: 32-bit floating point (`type: THREE.FloatType`) with `THREE.LinearFilter` for sub-texel interpolation and banding-free normal derivatives.
+- **FBO Separation**: Dedicated FBOs for `heightMap` and `alphaMap`.
+- **Canvas Container**: Centered square container (520x520) with thin gray border and pill-shaped `Reset` button.
 
 ---
 
@@ -81,5 +60,6 @@ Open your browser at **`http://localhost:3000`**.
 
 ---
 
-## 4. Credits & Acknowledgments
-- [Misaki Nakano (mofu-dev)](https://mofu-dev.com/en/blog/fluid-foundation/) for the original creative concept and Matcap inspiration.
+## 4. Credits
+- [Misaki Nakano (mofu-dev)](https://mofu-dev.com/en/blog/fluid-foundation/) for the original concept and algorithms.
+- [mnmxmx/fluid-three](https://github.com/mnmxmx/fluid-three) for the WebGL Stable Fluids reference.

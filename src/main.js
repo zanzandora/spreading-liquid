@@ -1,4 +1,5 @@
 import * as THREE from 'three';
+import { FluidSimulation } from './simulation/FluidSimulation.js';
 import { LiquidSurface } from './simulation/LiquidSurface.js';
 import { LiquidInteractionHandler } from './ui/LiquidUIBridge.js';
 
@@ -31,12 +32,23 @@ class SpreadingLiquidApp {
     }
 
     initSimulations() {
-        // 2.5D Viscoplastic Paste Smearing (Local Heightfield Deformation)
-        this.liquidSurface = new LiquidSurface(this.renderer, {
+        // 1. Navier-Stokes Solver from mnmxmx/fluid-three
+        this.fluidSim = new FluidSimulation(this.renderer, {
+            simResolution: 128,
+            iterations: 32,
+            mouseForce: 18.0,
+            splatRadius: 0.080,
+            dissipation: 0.22,
+            BFECC: true,
+            dt: 0.014
+        });
+
+        // 2. Liquid Surface Height Map & Alpha Map from mofu-dev
+        this.liquidSurface = new LiquidSurface(this.renderer, this.fluidSim, {
             resolution: 512,
-            dropRadius: 0.165,
-            brushRadius: 0.082,
-            normalScale: 0.45
+            velocityThresholdMin: 0.003,
+            velocityThresholdMax: 0.055,
+            dt: 0.014
         });
 
         this.onResize();
@@ -44,7 +56,7 @@ class SpreadingLiquidApp {
 
     initInteraction() {
         this.interaction = new LiquidInteractionHandler(
-            this.liquidSurface,
+            this.fluidSim,
             this.renderer.domElement
         );
     }
@@ -55,6 +67,7 @@ class SpreadingLiquidApp {
         if (resetBtn) {
             resetBtn.addEventListener('click', (e) => {
                 e.stopPropagation();
+                this.fluidSim.clear();
                 this.liquidSurface.resetToInitialDrop();
             });
         }
@@ -68,13 +81,22 @@ class SpreadingLiquidApp {
         const width = this.container.clientWidth || 520;
         const height = this.container.clientHeight || 520;
         this.renderer.setSize(width, height);
+        this.fluidSim.setSize(width, height);
         this.liquidSurface.setSize(width, height);
     }
 
     animate() {
         requestAnimationFrame(this.animate);
 
-        // Render shaded 2.5D liquid surface to screen
+        const dt = 0.014;
+
+        // 1. Step Eulerian Navier-Stokes solver
+        this.fluidSim.step(dt);
+
+        // 2. Advect liquid thickness heightMap & update historical alphaMap
+        this.liquidSurface.update(dt);
+
+        // 3. Render shaded surface to screen
         this.renderer.clear();
         this.liquidSurface.renderToScreen();
     }

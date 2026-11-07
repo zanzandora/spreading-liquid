@@ -2,7 +2,8 @@ import * as THREE from 'three';
 
 /**
  * PingPongRenderTarget
- * Manages double-buffered WebGLRenderTargets for GPGPU ping-pong passes.
+ * Double-buffered WebGLRenderTargets for GPGPU ping-pong simulation passes.
+ * Uses 32-bit FloatType by default for smooth normal derivatives without banding.
  */
 export class PingPongRenderTarget {
     constructor(width, height, options = {}) {
@@ -13,7 +14,7 @@ export class PingPongRenderTarget {
             minFilter: THREE.LinearFilter,
             magFilter: THREE.LinearFilter,
             format: THREE.RGBAFormat,
-            type: THREE.HalfFloatType,
+            type: THREE.FloatType, // 32-bit float as emphasized in mofu-dev
             depthBuffer: false,
             stencilBuffer: false
         };
