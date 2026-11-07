@@ -1,193 +1,157 @@
 import * as THREE from 'three';
-import { PingPongRenderTarget } from './PingPongRenderTarget.js';
-import { createLiquidMatcapTexture } from '../materials/matcap.js';
+import { Pass, createRenderTarget } from './Pass.js';
 import {
     baseVert,
     initDropFrag,
     heightFrag,
-    alphaFrag,
-    renderFrag
+    alphaFrag
 } from '../shaders/shaders.js';
 
 /**
  * LiquidSurface
- * Implements mofu-dev's height-map liquid spreading driven by Navier-Stokes velocity,
- * historical alpha map tracking, and normal-mapped Matcap rendering.
- * https://mofu-dev.com/blog/fluid-foundation/
+ * Authentic height-map & alpha-tracking liquid surface from mofu-dev:
+ * - Ping-pong heightMap updated with velocity backtrace & velocityThreshold (0.05, 0.25)
+ * - Alpha map initialized cleanly at 0 so no ghost silhouette remains
+ * - Historical maximum tracking so faded liquid leaves realistic wetting traces
  */
 export class LiquidSurface {
-    constructor(renderer, fluidSim, options = {}) {
+    constructor(renderer, width = 520, height = 520, simulation, variant = 1, trackAlpha = true) {
         this.renderer = renderer;
-        this.fluidSim = fluidSim;
+        this.simulation = simulation;
+        this.variant = variant;
+        this.trackAlpha = trackAlpha;
+        this.resolution = new THREE.Vector2(width, height);
+        const floatType = simulation.floatType;
 
-        this.options = Object.assign({
-            resolution: 512,
-            velocityThresholdMin: 0.003,   // Velocity threshold floor: keeps static regions locked
-            velocityThresholdMax: 0.055,   // Saturation ceiling for 30% advection step
-            dt: 0.014
-        }, options);
+        this.heightPairs = [
+            [createRenderTarget(width, height, floatType), createRenderTarget(width, height, floatType)]
+        ];
+        this.alphaTargets = trackAlpha ? [
+            createRenderTarget(width, height, floatType),
+            createRenderTarget(width, height, floatType)
+        ] : [];
 
-        this.width = this.options.resolution;
-        this.height = this.options.resolution;
+        this.heightIndex = 0;
+        this.alphaIndex = 0;
+        this.useFloat = true;
 
-        this.fboSize = new THREE.Vector2(this.width, this.height);
-        this.resolution = new THREE.Vector2(this.width, this.height);
+        this.initialPass = new Pass(
+            renderer,
+            new THREE.RawShaderMaterial({
+                vertexShader: baseVert,
+                fragmentShader: initDropFrag,
+                uniforms: {
+                    resolution: { value: this.resolution }
+                },
+                depthTest: false,
+                depthWrite: false
+            })
+        );
 
-        this.matcapTexture = createLiquidMatcapTexture();
+        this.heightPass = new Pass(
+            renderer,
+            new THREE.RawShaderMaterial({
+                vertexShader: baseVert,
+                fragmentShader: heightFrag,
+                uniforms: {
+                    heightMap: { value: null },
+                    velocity: { value: simulation.targets.velocity1.texture },
+                    dt: { value: simulation.dt },
+                    fboSize: { value: simulation.fboSize },
+                    velocityThreshold: { value: new THREE.Vector2(0.05, 0.25) }
+                },
+                depthTest: false,
+                depthWrite: false
+            })
+        );
 
-        this.initGPGPU();
-        this.initRenderTargets();
-        this.initMaterials();
-        this.resetToInitialDrop();
+        this.alphaPass = trackAlpha ? new Pass(
+            renderer,
+            new THREE.RawShaderMaterial({
+                vertexShader: baseVert,
+                fragmentShader: alphaFrag,
+                uniforms: {
+                    heightMap: { value: null },
+                    alphaMap: { value: this.alphaTargets[0].texture }
+                },
+                depthTest: false,
+                depthWrite: false
+            })
+        ) : null;
+
+        this.reset();
     }
 
-    initGPGPU() {
-        this.camera = new THREE.Camera();
-        this.scene = new THREE.Scene();
-        this.geometry = new THREE.PlaneGeometry(2, 2);
-        this.quad = new THREE.Mesh(this.geometry, null);
-        this.scene.add(this.quad);
+    get heightTexture() {
+        return this.heightPairs[0][this.heightIndex].texture;
     }
 
-    initRenderTargets() {
-        // As highlighted in mofu-dev "Bonus: Texture Precision":
-        // 32-bit FloatType is essential for smooth analytical cross normals without quantization banding.
-        const opts = {
-            minFilter: THREE.LinearFilter,
-            magFilter: THREE.LinearFilter,
-            format: THREE.RGBAFormat,
-            type: THREE.FloatType, // 32-bit float
-            depthBuffer: false,
-            stencilBuffer: false
-        };
-
-        this.heightMap = new PingPongRenderTarget(this.width, this.height, opts);
-        this.alphaMap = new PingPongRenderTarget(this.width, this.height, opts);
+    get alphaTexture() {
+        return this.alphaTargets[this.alphaIndex]?.texture ?? null;
     }
 
-    initMaterials() {
-        // 1. Initial Droplet Dome Material (initialHeight.frag)
-        this.initDropMaterial = new THREE.RawShaderMaterial({
-            vertexShader: baseVert,
-            fragmentShader: initDropFrag,
-            uniforms: {
-                uResolution: { value: this.resolution }
-            },
-            depthTest: false,
-            depthWrite: false
-        });
+    reset() {
+        const curTarget = this.renderer.getRenderTarget();
 
-        // 2. Height Advection & Mass Transfer Material (height.frag)
-        this.heightMaterial = new THREE.RawShaderMaterial({
-            vertexShader: baseVert,
-            fragmentShader: heightFrag,
-            uniforms: {
-                uVelocity: { value: null },
-                uHeightMap: { value: null },
-                uFboSize: { value: this.fboSize },
-                uDt: { value: this.options.dt },
-                uVelocityThreshold: {
-                    value: new THREE.Vector2(
-                        this.options.velocityThresholdMin,
-                        this.options.velocityThresholdMax
-                    )
-                }
-            },
-            depthTest: false,
-            depthWrite: false
-        });
+        // 1. Render initial drop dome to both height ping-pong buffers
+        for (const pair of this.heightPairs) {
+            this.initialPass.render(pair[0]);
+            this.initialPass.render(pair[1]);
+        }
 
-        // 3. Historical Alpha Map Material (alpha.frag)
-        this.alphaMaterial = new THREE.RawShaderMaterial({
-            vertexShader: baseVert,
-            fragmentShader: alphaFrag,
-            uniforms: {
-                uHeightMap: { value: null },
-                uAlphaMap: { value: null }
-            },
-            depthTest: false,
-            depthWrite: false
-        });
-
-        // 4. Final Render & Matcap Shading Material (render.frag)
-        this.renderMaterial = new THREE.RawShaderMaterial({
-            vertexShader: baseVert,
-            fragmentShader: renderFrag,
-            uniforms: {
-                uHeightMap: { value: null },
-                uAlphaMap: { value: null },
-                uMatcap: { value: this.matcapTexture },
-                uResolution: { value: this.resolution }
-            },
-            depthTest: false,
-            depthWrite: false
-        });
-    }
-
-    renderPass(material, target) {
-        this.quad.material = material;
-        this.renderer.setRenderTarget(target);
-        this.renderer.render(this.scene, this.camera);
-        this.renderer.setRenderTarget(null);
-    }
-
-    resetToInitialDrop() {
-        // Clear both render targets to transparent black
-        const clearTarget = (t) => {
+        // 2. Clear alpha targets to transparent black (0, 0, 0, 0)
+        // No ghost circle is pre-filled, so unvisited canvas stays 100% clean white!
+        const curClearColor = this.renderer.getClearColor(new THREE.Color());
+        const curClearAlpha = this.renderer.getClearAlpha();
+        this.renderer.setClearColor(0, 0);
+        for (const t of this.alphaTargets) {
             this.renderer.setRenderTarget(t);
-            this.renderer.clearColor();
-        };
+            this.renderer.clear();
+        }
+        this.renderer.setClearColor(curClearColor, curClearAlpha);
+        this.renderer.setRenderTarget(curTarget);
 
-        clearTarget(this.heightMap.read);
-        clearTarget(this.heightMap.write);
-        clearTarget(this.alphaMap.read);
-        clearTarget(this.alphaMap.write);
-        this.renderer.setRenderTarget(null);
-
-        // Render the initial 3D droplet into heightMap.read
-        this.initDropMaterial.uniforms.uResolution.value.copy(this.resolution);
-        this.renderPass(this.initDropMaterial, this.heightMap.read);
-
-        // Pre-fill alpha map with initial height
-        this.alphaMaterial.uniforms.uHeightMap.value = this.heightMap.read.texture;
-        this.alphaMaterial.uniforms.uAlphaMap.value = this.alphaMap.read.texture;
-        this.renderPass(this.alphaMaterial, this.alphaMap.write);
-        this.alphaMap.swap();
+        this.heightIndex = 0;
+        this.alphaIndex = 0;
     }
 
-    update(dt = this.options.dt) {
-        // 1. Height Advection Pass (height.frag)
-        this.heightMaterial.uniforms.uVelocity.value = this.fluidSim.velocity.read.texture;
-        this.heightMaterial.uniforms.uHeightMap.value = this.heightMap.read.texture;
-        this.heightMaterial.uniforms.uDt.value = dt;
-        this.renderPass(this.heightMaterial, this.heightMap.write);
-        this.heightMap.swap();
-
-        // 2. Alpha Map Pass (alpha.frag)
-        this.alphaMaterial.uniforms.uHeightMap.value = this.heightMap.read.texture;
-        this.alphaMaterial.uniforms.uAlphaMap.value = this.alphaMap.read.texture;
-        this.renderPass(this.alphaMaterial, this.alphaMap.write);
-        this.alphaMap.swap();
+    resize(w, h) {
+        this.resolution.set(w, h);
+        for (const t of [...this.heightPairs.flat(), ...this.alphaTargets]) {
+            t.setSize(w, h);
+        }
+        this.reset();
     }
 
-    renderToScreen() {
-        this.renderMaterial.uniforms.uHeightMap.value = this.heightMap.read.texture;
-        this.renderMaterial.uniforms.uAlphaMap.value = this.alphaMap.read.texture;
-        this.quad.material = this.renderMaterial;
-        this.renderer.setRenderTarget(null);
-        this.renderer.render(this.scene, this.camera);
-    }
+    update() {
+        const curTarget = this.renderer.getRenderTarget();
+        const nextHeightIndex = 1 - this.heightIndex;
 
-    setSize(width, height) {
-        this.resolution.set(width, height);
-        this.initDropMaterial.uniforms.uResolution.value.set(width, height);
-        this.renderMaterial.uniforms.uResolution.value.set(width, height);
+        // 1. Height transport pass
+        for (const pair of this.heightPairs) {
+            this.heightPass.material.uniforms.heightMap.value = pair[this.heightIndex].texture;
+            this.heightPass.render(pair[nextHeightIndex]);
+        }
+        this.heightIndex = nextHeightIndex;
+
+        // 2. Alpha tracking pass
+        if (this.alphaPass) {
+            const nextAlphaIndex = 1 - this.alphaIndex;
+            this.alphaPass.material.uniforms.heightMap.value = this.heightTexture;
+            this.alphaPass.material.uniforms.alphaMap.value = this.alphaTargets[this.alphaIndex].texture;
+            this.alphaPass.render(this.alphaTargets[nextAlphaIndex]);
+            this.alphaIndex = nextAlphaIndex;
+        }
+
+        this.renderer.setRenderTarget(curTarget);
     }
 
     dispose() {
-        this.heightMap.dispose();
-        this.alphaMap.dispose();
-        this.matcapTexture.dispose();
-        this.geometry.dispose();
+        this.initialPass.dispose();
+        this.heightPass.dispose();
+        this.alphaPass?.dispose();
+        for (const t of [...this.heightPairs.flat(), ...this.alphaTargets]) {
+            t.dispose();
+        }
     }
 }

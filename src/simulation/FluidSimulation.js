@@ -1,217 +1,244 @@
 import * as THREE from 'three';
-import { PingPongRenderTarget } from './PingPongRenderTarget.js';
+import { Pass, createRenderTarget } from './Pass.js';
 import {
-    baseVert,
-    splatFrag,
+    boundaryVert,
+    forceVert,
+    forceFrag,
     advectionFrag,
+    viscousFrag,
     divergenceFrag,
-    pressureFrag,
+    poissonFrag,
     gradientSubtractFrag
 } from '../shaders/shaders.js';
 
 /**
  * FluidSimulation
- * Eulerian Navier-Stokes solver rebuilt directly from mnmxmx/fluid-three.
- * Uses 2nd-order BFECC advection, 32 Jacobi Poisson pressure iterations,
- * and calibrated dissipation so velocity decays naturally like a viscous medium.
+ * Authentic Eulerian Navier-Stokes solver from mofu-dev:
+ * - 0.5x simulation resolution for natural fluid flow
+ * - 16 viscous diffusion iterations (viscosity = 16)
+ * - 16 Jacobi Poisson pressure solver iterations
+ * - Localized force brush splat quad (75px scale, 26x velocity multiplier)
+ * - Freezes velocity immediately when mouse is stationary (diff = 0)
  */
 export class FluidSimulation {
-    constructor(renderer, options = {}) {
+    constructor(renderer, width = 520, height = 520, variant = 1) {
         this.renderer = renderer;
+        this.variant = variant;
+        this.floatType = THREE.FloatType;
+        this.resolution = 0.5;
+        this.dt = 1 / 50;
 
-        this.options = Object.assign({
-            simResolution: 128,
-            iterations: 32,          // 32 Jacobi Poisson iterations from fluid-three
-            mouseForce: 18.0,        // Calibrated mouse force
-            splatRadius: 0.080,      // Brush splat radius in UV space
-            dissipation: 0.22,       // Viscous damping so velocity settles naturally
-            BFECC: true,             // Back and Forth Error Compensation from fluid-three
-            dt: 0.014
-        }, options);
+        this.fboSize = new THREE.Vector2();
+        this.cellScale = new THREE.Vector2();
+        this.boundarySpace = new THREE.Vector2();
 
-        this.simWidth = this.options.simResolution;
-        this.simHeight = this.options.simResolution;
-        this.aspectRatio = 1.0;
+        this.resizeVectors(width, height);
 
-        this.fboSize = new THREE.Vector2(this.simWidth, this.simHeight);
-        this.cellScale = new THREE.Vector2(1.0 / this.simWidth, 1.0 / this.simHeight);
-
-        this.initGPGPU();
-        this.initRenderTargets();
-        this.initMaterials();
-    }
-
-    initGPGPU() {
-        this.camera = new THREE.Camera();
-        this.scene = new THREE.Scene();
-        this.geometry = new THREE.PlaneGeometry(2, 2);
-        this.quad = new THREE.Mesh(this.geometry, null);
-        this.scene.add(this.quad);
-    }
-
-    initRenderTargets() {
-        const type = THREE.FloatType; // 32-bit float for velocity precision
-        const opts = {
-            minFilter: THREE.LinearFilter,
-            magFilter: THREE.LinearFilter,
-            format: THREE.RGBAFormat,
-            type: type,
-            depthBuffer: false,
-            stencilBuffer: false
-        };
-
-        this.velocity = new PingPongRenderTarget(this.simWidth, this.simHeight, opts);
-        this.pressure = new PingPongRenderTarget(this.simWidth, this.simHeight, opts);
-        this.divergence = new THREE.WebGLRenderTarget(this.simWidth, this.simHeight, opts);
-    }
-
-    initMaterials() {
-        // Splat Material
-        this.splatMaterial = new THREE.RawShaderMaterial({
-            vertexShader: baseVert,
-            fragmentShader: splatFrag,
-            uniforms: {
-                uTarget: { value: null },
-                uPoint: { value: new THREE.Vector2() },
-                uForce: { value: new THREE.Vector2() },
-                uRadius: { value: this.options.splatRadius },
-                uAspectRatio: { value: this.aspectRatio }
-            },
-            depthTest: false,
-            depthWrite: false
-        });
-
-        // Advection Material with BFECC (from fluid-three)
-        this.advectionMaterial = new THREE.RawShaderMaterial({
-            vertexShader: baseVert,
-            fragmentShader: advectionFrag,
-            uniforms: {
-                uVelocity: { value: null },
-                uSource: { value: null },
-                uFboSize: { value: this.fboSize },
-                uDt: { value: this.options.dt },
-                uDissipation: { value: this.options.dissipation },
-                uIsBFECC: { value: this.options.BFECC }
-            },
-            depthTest: false,
-            depthWrite: false
-        });
-
-        // Divergence Material (from fluid-three)
-        this.divergenceMaterial = new THREE.RawShaderMaterial({
-            vertexShader: baseVert,
-            fragmentShader: divergenceFrag,
-            uniforms: {
-                uVelocity: { value: null },
-                uDt: { value: this.options.dt },
-                uPx: { value: this.cellScale }
-            },
-            depthTest: false,
-            depthWrite: false
-        });
-
-        // Pressure Solver Material (Poisson Jacobi from fluid-three)
-        this.pressureMaterial = new THREE.RawShaderMaterial({
-            vertexShader: baseVert,
-            fragmentShader: pressureFrag,
-            uniforms: {
-                uPressure: { value: null },
-                uDivergence: { value: null },
-                uPx: { value: this.cellScale }
-            },
-            depthTest: false,
-            depthWrite: false
-        });
-
-        // Gradient Subtract Material (from fluid-three)
-        this.gradientSubtractMaterial = new THREE.RawShaderMaterial({
-            vertexShader: baseVert,
-            fragmentShader: gradientSubtractFrag,
-            uniforms: {
-                uPressure: { value: null },
-                uVelocity: { value: null },
-                uPx: { value: this.cellScale },
-                uDt: { value: this.options.dt }
-            },
-            depthTest: false,
-            depthWrite: false
-        });
-    }
-
-    renderPass(material, target) {
-        this.quad.material = material;
-        this.renderer.setRenderTarget(target);
-        this.renderer.render(this.scene, this.camera);
-        this.renderer.setRenderTarget(null);
-    }
-
-    addSplat(x, y, dx, dy, radius = this.options.splatRadius) {
-        this.splatMaterial.uniforms.uTarget.value = this.velocity.read.texture;
-        this.splatMaterial.uniforms.uPoint.value.set(x, y);
-        this.splatMaterial.uniforms.uForce.value.set(
-            dx * this.options.mouseForce,
-            dy * this.options.mouseForce
+        this.targets = Object.fromEntries(
+            ['velocity0', 'velocity1', 'viscous0', 'viscous1', 'divergence', 'pressure0', 'pressure1']
+                .map(name => [name, createRenderTarget(this.fboSize.x, this.fboSize.y, this.floatType)])
         );
-        this.splatMaterial.uniforms.uRadius.value = radius;
-        this.splatMaterial.uniforms.uAspectRatio.value = this.aspectRatio;
 
-        this.renderPass(this.splatMaterial, this.velocity.write);
-        this.velocity.swap();
+        this.createPasses();
+        this.clear();
     }
 
-    step(dt = this.options.dt) {
-        // 1. Divergence of Velocity Field
-        this.divergenceMaterial.uniforms.uVelocity.value = this.velocity.read.texture;
-        this.divergenceMaterial.uniforms.uDt.value = dt;
-        this.renderPass(this.divergenceMaterial, this.divergence);
+    resizeVectors(w, h) {
+        const n = Math.max(2, Math.round(w * this.resolution));
+        const r = Math.max(2, Math.round(h * this.resolution));
+        this.fboSize.set(n, r);
+        this.cellScale.set(1 / n, 1 / r);
+    }
 
-        // 2. Jacobi Iterative Solver for Pressure Poisson Equation (32 iters)
-        this.pressureMaterial.uniforms.uDivergence.value = this.divergence.texture;
-        for (let i = 0; i < this.options.iterations; i++) {
-            this.pressureMaterial.uniforms.uPressure.value = this.pressure.read.texture;
-            this.renderPass(this.pressureMaterial, this.pressure.write);
-            this.pressure.swap();
-        }
+    createPasses() {
+        // 1. Advection Pass (shader_C)
+        this.advection = new Pass(
+            this.renderer,
+            new THREE.RawShaderMaterial({
+                vertexShader: boundaryVert,
+                fragmentShader: advectionFrag,
+                uniforms: {
+                    boundarySpace: { value: this.cellScale },
+                    velocity: { value: this.targets.velocity1.texture },
+                    dt: { value: this.dt },
+                    fboSize: { value: this.fboSize }
+                },
+                depthTest: false,
+                depthWrite: false
+            })
+        );
 
-        // 3. Gradient Subtraction to enforce incompressibility
-        this.gradientSubtractMaterial.uniforms.uPressure.value = this.pressure.read.texture;
-        this.gradientSubtractMaterial.uniforms.uVelocity.value = this.velocity.read.texture;
-        this.gradientSubtractMaterial.uniforms.uDt.value = dt;
-        this.renderPass(this.gradientSubtractMaterial, this.velocity.write);
-        this.velocity.swap();
+        // 2. Viscous Diffusion Pass (shader_w)
+        this.viscous = new Pass(
+            this.renderer,
+            new THREE.RawShaderMaterial({
+                vertexShader: boundaryVert,
+                fragmentShader: viscousFrag,
+                uniforms: {
+                    boundarySpace: { value: this.boundarySpace },
+                    velocity: { value: this.targets.velocity0.texture },
+                    velocityNew: { value: this.targets.viscous0.texture },
+                    viscosity: { value: this.variant === 1 ? 16 : 6 },
+                    px: { value: this.cellScale }
+                },
+                depthTest: false,
+                depthWrite: false
+            })
+        );
 
-        // 4. Advect Velocity field itself with BFECC (from fluid-three)
-        this.advectionMaterial.uniforms.uVelocity.value = this.velocity.read.texture;
-        this.advectionMaterial.uniforms.uSource.value = this.velocity.read.texture;
-        this.advectionMaterial.uniforms.uDt.value = dt;
-        this.advectionMaterial.uniforms.uDissipation.value = this.options.dissipation;
-        this.renderPass(this.advectionMaterial, this.velocity.write);
-        this.velocity.swap();
+        // 3. Divergence Pass (shader_T)
+        this.divergence = new Pass(
+            this.renderer,
+            new THREE.RawShaderMaterial({
+                vertexShader: boundaryVert,
+                fragmentShader: divergenceFrag,
+                uniforms: {
+                    boundarySpace: { value: this.boundarySpace },
+                    velocity: { value: this.targets.viscous0.texture },
+                    px: { value: this.cellScale }
+                },
+                depthTest: false,
+                depthWrite: false
+            })
+        );
+
+        // 4. Pressure Poisson Solver Pass (shader_E)
+        this.poisson = new Pass(
+            this.renderer,
+            new THREE.RawShaderMaterial({
+                vertexShader: boundaryVert,
+                fragmentShader: poissonFrag,
+                uniforms: {
+                    boundarySpace: { value: this.boundarySpace },
+                    pressure: { value: this.targets.pressure0.texture },
+                    divergence: { value: this.targets.divergence.texture },
+                    px: { value: this.cellScale }
+                },
+                depthTest: false,
+                depthWrite: false
+            })
+        );
+
+        // 5. Gradient Subtraction Pass (shader_ee)
+        this.pressure = new Pass(
+            this.renderer,
+            new THREE.RawShaderMaterial({
+                vertexShader: boundaryVert,
+                fragmentShader: gradientSubtractFrag,
+                uniforms: {
+                    boundarySpace: { value: this.boundarySpace },
+                    pressure: { value: this.targets.pressure0.texture },
+                    velocity: { value: this.targets.viscous0.texture },
+                    px: { value: this.cellScale }
+                },
+                depthTest: false,
+                depthWrite: false
+            })
+        );
+
+        // 6. Force Injection Pass (shader_x, shader_D)
+        this.force = new Pass(
+            this.renderer,
+            new THREE.RawShaderMaterial({
+                vertexShader: forceVert,
+                fragmentShader: forceFrag,
+                uniforms: {
+                    velocity: { value: this.targets.velocity0.texture },
+                    force: { value: new THREE.Vector2() },
+                    center: { value: new THREE.Vector2() },
+                    scale: { value: new THREE.Vector2(this.variant === 2 ? 78 : 75, this.variant === 2 ? 78 : 75) },
+                    px: { value: this.cellScale },
+                    fboSize: { value: this.fboSize }
+                },
+                transparent: true,
+                depthTest: false,
+                depthWrite: false
+            }),
+            new THREE.PlaneGeometry(1, 1)
+        );
     }
 
     clear() {
-        const clearTarget = (t) => {
-            this.renderer.setRenderTarget(t);
-            this.renderer.clearColor();
-        };
+        const curTarget = this.renderer.getRenderTarget();
+        const curClearColor = this.renderer.getClearColor(new THREE.Color());
+        const curClearAlpha = this.renderer.getClearAlpha();
 
-        clearTarget(this.velocity.read);
-        clearTarget(this.velocity.write);
-        clearTarget(this.pressure.read);
-        clearTarget(this.pressure.write);
-        clearTarget(this.divergence);
-        this.renderer.setRenderTarget(null);
+        this.renderer.setClearColor(0, 0);
+        for (const t of Object.values(this.targets)) {
+            this.renderer.setRenderTarget(t);
+            this.renderer.clear();
+        }
+        this.renderer.setClearColor(curClearColor, curClearAlpha);
+        this.renderer.setRenderTarget(curTarget);
     }
 
-    setSize(width, height) {
-        this.aspectRatio = width / height;
-        this.splatMaterial.uniforms.uAspectRatio.value = this.aspectRatio;
+    resize(w, h) {
+        this.resizeVectors(w, h);
+        for (const t of Object.values(this.targets)) {
+            t.setSize(this.fboSize.x, this.fboSize.y);
+        }
+        this.clear();
+    }
+
+    update(interaction) {
+        if (!interaction || interaction.diff.lengthSq() === 0) {
+            this.clear();
+            return;
+        }
+
+        const curTarget = this.renderer.getRenderTarget();
+        const autoClear = this.renderer.autoClear;
+        this.renderer.autoClear = false;
+
+        try {
+            // 1. Advection
+            this.advection.render(this.targets.velocity0);
+
+            // 2. Viscous Diffusion (16 iters)
+            let viscousResult = this.targets.viscous0;
+            for (let i = 0; i < 16; i++) {
+                const src = i % 2 === 0 ? this.targets.viscous0 : this.targets.viscous1;
+                const dst = i % 2 === 0 ? this.targets.viscous1 : this.targets.viscous0;
+                this.viscous.material.uniforms.velocityNew.value = src.texture;
+                this.viscous.render(dst);
+                viscousResult = dst;
+            }
+
+            // 3. Divergence
+            this.divergence.material.uniforms.velocity.value = viscousResult.texture;
+            this.divergence.render(this.targets.divergence);
+
+            // 4. Poisson Pressure Solver (16 iters)
+            let pressureResult = this.targets.pressure0;
+            for (let i = 0; i < 16; i++) {
+                const src = i % 2 === 0 ? this.targets.pressure0 : this.targets.pressure1;
+                const dst = i % 2 === 0 ? this.targets.pressure1 : this.targets.pressure0;
+                this.poisson.material.uniforms.pressure.value = src.texture;
+                this.poisson.render(dst);
+                pressureResult = dst;
+            }
+
+            // 5. Pressure Gradient Subtraction
+            this.pressure.material.uniforms.velocity.value = viscousResult.texture;
+            this.pressure.material.uniforms.pressure.value = pressureResult.texture;
+            this.pressure.render(this.targets.velocity1);
+
+            // 6. Force Injection (Mouse Splat)
+            this.force.material.uniforms.force.value.copy(interaction.diff).multiplyScalar(26);
+            this.force.material.uniforms.center.value.copy(interaction.coords);
+            this.force.render(this.targets.velocity1);
+        } finally {
+            this.renderer.setRenderTarget(curTarget);
+            this.renderer.autoClear = autoClear;
+        }
     }
 
     dispose() {
-        this.velocity.dispose();
-        this.pressure.dispose();
-        this.divergence.dispose();
-        this.geometry.dispose();
+        for (const p of [this.advection, this.viscous, this.divergence, this.poisson, this.pressure, this.force]) {
+            p.dispose();
+        }
+        for (const t of Object.values(this.targets)) {
+            t.dispose();
+        }
     }
 }

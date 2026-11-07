@@ -1,94 +1,102 @@
+import * as THREE from 'three';
+
 /**
  * LiquidInteractionHandler
- * Handles mouse and touch drag interactions on the canvas,
- * injecting velocity into the Eulerian Navier-Stokes solver.
+ * Implements the authentic pointer tracking from mofu-dev:
+ * - Coordinates normalized to NDC [-1, 1] adjusted by displayScale (1.12)
+ * - Lerps target with 0.7 damping factor for buttery smooth stroke continuation
+ * - Emits diff vector used to inject physical force into fluid velocity field
  */
 export class LiquidInteractionHandler {
-    constructor(fluidSim, canvasElement) {
-        this.fluidSim = fluidSim;
-        this.canvas = canvasElement;
+    constructor(canvas, displayScale = 1.12) {
+        this.canvas = canvas;
+        this.displayScale = displayScale;
 
-        this.currPos = { x: 0.5, y: 0.5 };
-        this.prevPos = { x: 0.5, y: 0.5 };
-        this.isDown = false;
-        this.splatRadius = 0.080;
+        this.target = new THREE.Vector2();
+        this.coords = new THREE.Vector2();
+        this.previous = new THREE.Vector2();
+        this.diff = new THREE.Vector2();
 
-        this.bindEvents();
+        this.dragging = false;
+        this.moved = false;
+
+        this.pointerDown = this.pointerDown.bind(this);
+        this.pointerMove = this.pointerMove.bind(this);
+        this.pointerUp = this.pointerUp.bind(this);
+
+        this.mount(canvas);
     }
 
-    bindEvents() {
-        const getNormalizedPos = (clientX, clientY) => {
-            const rect = this.canvas.getBoundingClientRect();
-            return {
-                x: Math.max(0.0, Math.min(1.0, (clientX - rect.left) / rect.width)),
-                // Flip Y because WebGL UV origin (0, 0) is at bottom-left
-                y: Math.max(0.0, Math.min(1.0, 1.0 - (clientY - rect.top) / rect.height))
-            };
-        };
+    mount(canvas) {
+        this.unmount();
+        this.canvas = canvas;
+        canvas.addEventListener('pointerdown', this.pointerDown);
+        canvas.addEventListener('pointermove', this.pointerMove);
+        canvas.addEventListener('pointerup', this.pointerUp);
+        canvas.addEventListener('pointercancel', this.pointerUp);
+        canvas.addEventListener('pointerleave', this.pointerUp);
+    }
 
-        // Pointer Down (drag start)
-        this.canvas.addEventListener('pointerdown', (e) => {
-            if (e.button !== undefined && e.button !== 0) return;
+    setTarget(e) {
+        const rect = this.canvas.getBoundingClientRect();
+        this.target.set(
+            ((e.clientX - rect.left) / rect.width * 2 - 1) / this.displayScale,
+            (-((e.clientY - rect.top) / rect.height * 2) + 1) / this.displayScale
+        );
+        if (!this.moved) {
+            this.coords.copy(this.target);
+            this.previous.copy(this.target);
+            this.moved = true;
+        }
+    }
 
-            this.isDown = true;
-            try { this.canvas.setPointerCapture(e.pointerId); } catch {}
+    pointerDown(e) {
+        if (e.button !== undefined && e.button !== 0) return;
+        this.dragging = true;
+        try { this.canvas.setPointerCapture(e.pointerId); } catch {}
+        this.setTarget(e);
+        this.coords.copy(this.target);
+        this.previous.copy(this.target);
+        this.diff.set(0, 0);
+    }
 
-            const pos = getNormalizedPos(e.clientX, e.clientY);
-            this.currPos.x = pos.x;
-            this.currPos.y = pos.y;
-            this.prevPos.x = pos.x;
-            this.prevPos.y = pos.y;
-        });
+    pointerMove(e) {
+        if (this.dragging) {
+            this.setTarget(e);
+        }
+    }
 
-        // Pointer Move (drag smear)
-        this.canvas.addEventListener('pointermove', (e) => {
-            const pos = getNormalizedPos(e.clientX, e.clientY);
-            this.currPos.x = pos.x;
-            this.currPos.y = pos.y;
+    pointerUp(e) {
+        this.dragging = false;
+        try { this.canvas.releasePointerCapture(e.pointerId); } catch {}
+    }
 
-            if (this.isDown) {
-                const totalDx = this.currPos.x - this.prevPos.x;
-                const totalDy = this.currPos.y - this.prevPos.y;
-                const dist = Math.hypot(totalDx, totalDy);
+    update() {
+        this.coords.lerp(this.target, 0.7);
+        this.diff.subVectors(this.coords, this.previous);
+        this.previous.copy(this.coords);
+        if (this.diff.lengthSq() < 1e-10) {
+            this.diff.set(0, 0);
+        }
+    }
 
-                if (dist > 0.0004) {
-                    const stepDistance = this.splatRadius * 0.45;
-                    const steps = Math.min(5, Math.max(1, Math.ceil(dist / stepDistance)));
+    reset() {
+        this.dragging = false;
+        this.moved = false;
+        this.target.set(0, 0);
+        this.coords.set(0, 0);
+        this.previous.set(0, 0);
+        this.diff.set(0, 0);
+    }
 
-                    const stepDx = totalDx / steps;
-                    const stepDy = totalDy / steps;
-
-                    for (let i = 1; i <= steps; i++) {
-                        const t = i / steps;
-                        const interpX = this.prevPos.x + totalDx * t;
-                        const interpY = this.prevPos.y + totalDy * t;
-
-                        this.fluidSim.addSplat(
-                            interpX,
-                            interpY,
-                            stepDx,
-                            stepDy,
-                            this.splatRadius
-                        );
-                    }
-
-                    this.prevPos.x = this.currPos.x;
-                    this.prevPos.y = this.currPos.y;
-                }
-            } else {
-                this.prevPos.x = this.currPos.x;
-                this.prevPos.y = this.currPos.y;
-            }
-        });
-
-        // Pointer Up / Cancel (drag end)
-        const handlePointerUp = (e) => {
-            this.isDown = false;
-            try { this.canvas.releasePointerCapture(e.pointerId); } catch {}
-        };
-
-        this.canvas.addEventListener('pointerup', handlePointerUp);
-        this.canvas.addEventListener('pointercancel', handlePointerUp);
-        window.addEventListener('blur', () => { this.isDown = false; });
+    unmount() {
+        if (!this.canvas) return;
+        this.canvas.removeEventListener('pointerdown', this.pointerDown);
+        this.canvas.removeEventListener('pointermove', this.pointerMove);
+        this.canvas.removeEventListener('pointerup', this.pointerUp);
+        this.canvas.removeEventListener('pointercancel', this.pointerUp);
+        this.canvas.removeEventListener('pointerleave', this.pointerUp);
+        this.canvas = null;
+        this.reset();
     }
 }
